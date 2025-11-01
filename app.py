@@ -1,3 +1,4 @@
+
 from flask import Flask, jsonify, request, render_template_string, redirect
 from flask_cors import CORS
 import requests
@@ -7,6 +8,8 @@ import base64
 import json
 import threading
 import time
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
 app = Flask(__name__)
 CORS(app)
@@ -15,18 +18,26 @@ TMDB_BASE_URL = "https://api.themoviedb.org/3"
 
 # Global movie cache per API key
 movie_cache = {}
+cache_metadata = {}  # Store cache creation time and API key
 cache_lock = threading.Lock()
+
+# Scheduler for automatic refresh
+scheduler = BackgroundScheduler()
+scheduler.start()
 
 def fetch_and_cache_movies(api_key, language="ml"):
     """Fetch all Malayalam OTT movies from TMDB and cache them"""
     cache_key = f"{api_key}_{language}"
 
     print(f"[CACHE] Fetching {language.upper()} OTT movies...")
+    print(f"[CACHE] Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     today = datetime.now().strftime("%Y-%m-%d")
     final_movies = []
 
     for page in range(1, 1000):
-        print(f"[INFO] Checking page {page}")
+        if page % 100 == 0:
+            print(f"[INFO] Checking page {page}...")
+
         params = {
             "api_key": api_key,
             "with_original_language": language,
@@ -90,8 +101,13 @@ def fetch_and_cache_movies(api_key, language="ml"):
 
     with cache_lock:
         movie_cache[cache_key] = unique_movies
+        cache_metadata[cache_key] = {
+            "updated_at": datetime.now().isoformat(),
+            "movie_count": len(unique_movies)
+        }
 
     print(f"[CACHE] Fetched {len(unique_movies)} {language.upper()} OTT movies ✅")
+    print(f"[CACHE] Completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     return unique_movies
 
 def to_stremio_meta(movie):
@@ -127,6 +143,34 @@ def encode_user_config(config_dict):
     """Encode user configuration to base64 for URL"""
     json_str = json.dumps(config_dict)
     return base64.b64encode(json_str.encode('utf-8')).decode('utf-8')
+
+def schedule_cache_refresh(api_key, language="ml"):
+    """Schedule automatic daily refresh for cache"""
+    cache_key = f"{api_key}_{language}"
+    job_id = f"refresh_{cache_key}"
+
+    # Remove existing job if present
+    try:
+        scheduler.remove_job(job_id)
+    except:
+        pass
+
+    # Schedule refresh every 24 hours
+    def refresh_job():
+        print(f"[SCHEDULER] Automatic refresh triggered for {cache_key}")
+        try:
+            fetch_and_cache_movies(api_key, language)
+            print(f"[SCHEDULER] ✅ Refresh completed for {cache_key}")
+        except Exception as e:
+            print(f"[SCHEDULER] ❌ Refresh failed for {cache_key}: {e}")
+
+    scheduler.add_job(
+        refresh_job,
+        trigger=IntervalTrigger(hours=24),
+        id=job_id,
+        replace_existing=True
+    )
+    print(f"[SCHEDULER] Scheduled daily refresh for {cache_key}")
 
 # HTML Configuration Page
 CONFIGURE_HTML = """
@@ -315,15 +359,6 @@ CONFIGURE_HTML = """
             transform: translateY(0);
         }
 
-        .error {
-            background: #fee;
-            color: #c33;
-            padding: 12px;
-            border-radius: 8px;
-            margin-bottom: 20px;
-            border-left: 4px solid #c33;
-        }
-
         .note {
             background: #e3f2fd;
             color: #1565c0;
@@ -332,6 +367,16 @@ CONFIGURE_HTML = """
             margin-top: 20px;
             font-size: 0.9em;
             border-left: 4px solid #1565c0;
+        }
+
+        .refresh-info {
+            background: #f0f7ff;
+            color: #0066cc;
+            padding: 12px;
+            border-radius: 8px;
+            margin-top: 15px;
+            font-size: 0.9em;
+            border-left: 4px solid #0066cc;
         }
 
         @media (max-width: 600px) {
@@ -373,6 +418,10 @@ CONFIGURE_HTML = """
             </div>
 
             <button type="submit" class="submit-btn">✨ Configure & Install</button>
+
+            <div class="refresh-info">
+                <strong>🔄 Auto-Refresh:</strong> Catalog refreshes automatically once every 24 hours to show newly released movies on OTT platforms.
+            </div>
 
             <div class="note">
                 <strong>Note:</strong> More languages (Hindi, Tamil, Telugu, Kannada) coming soon! This addon only displays movie catalogs - it doesn't provide streaming links.
@@ -443,6 +492,7 @@ def manifest(config_string):
     if not config or "api_key" not in config:
         return jsonify({"error": "Invalid configuration"}), 400
 
+    api_key = config["api_key"]
     languages = config.get("languages", ["ml"])
 
     # Build catalogs for selected languages
@@ -498,6 +548,8 @@ def catalog(config_string, language):
             # Start background fetch if not already cached
             def fetch_in_background():
                 fetch_and_cache_movies(api_key, language)
+                # Schedule daily refresh after first fetch
+                schedule_cache_refresh(api_key, language)
 
             threading.Thread(target=fetch_in_background, daemon=True).start()
 
@@ -538,9 +590,37 @@ def refresh(config_string):
 
     threading.Thread(target=do_refresh, daemon=True).start()
 
-    return jsonify({"status": "refresh started in background"})
+    return jsonify({"status": "refresh started in background", "message": "Checking for new movies..."})
+
+@app.route("/<config_string>/status")
+def status(config_string):
+    """Get cache status and last update time"""
+    config = decode_user_config(config_string)
+
+    if not config or "api_key" not in config:
+        return jsonify({"error": "Invalid configuration"}), 400
+
+    api_key = config["api_key"]
+    languages = config.get("languages", ["ml"])
+
+    status_data = {
+        "addon": "IndCat",
+        "version": "1.0.0",
+        "languages": languages,
+        "caches": {}
+    }
+
+    for lang in languages:
+        cache_key = f"{api_key}_{lang}"
+        if cache_key in cache_metadata:
+            status_data["caches"][lang] = cache_metadata[cache_key]
+        else:
+            status_data["caches"][lang] = {"status": "not cached yet"}
+
+    return jsonify(status_data)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     print(f"🚀 Starting IndCat Stremio Addon on 0.0.0.0:{port}")
+    print(f"📅 Automatic daily cache refresh enabled with APScheduler")
     app.run(host="0.0.0.0", port=port, debug=False)
